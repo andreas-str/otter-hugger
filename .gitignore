@@ -1,0 +1,12 @@
+
+discord_bot/.env
+discord_bot/AmazonRootCA1.pem
+discord_bot/certificate.pem.crt
+discord_bot/otter_database.db
+discord_bot/private.pem.key
+otter_main/build/esp32.esp32.adafruit_qtpy_esp32s3_n4r2/otter_main.ino.bin
+otter_main/build/esp32.esp32.adafruit_qtpy_esp32s3_n4r2/otter_main.ino.bootloader.bin
+otter_main/build/esp32.esp32.adafruit_qtpy_esp32s3_n4r2/otter_main.ino.elf
+otter_main/build/esp32.esp32.adafruit_qtpy_esp32s3_n4r2/otter_main.ino.map
+otter_main/build/esp32.esp32.adafruit_qtpy_esp32s3_n4r2/otter_main.ino.merged.bin
+otter_main/build/esp32.esp32.adafruit_qtpy_esp32s3_n4r2/otter_main.ino.partitions.bin

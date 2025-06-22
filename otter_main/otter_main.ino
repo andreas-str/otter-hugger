@@ -1,13 +1,57 @@
-#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager
-#include "AdafruitIO_WiFi.h"
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <EasyButton.h>
 #include <Wire.h>
+#include <Uptime.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
 #include "Adafruit_DRV2605.h"
 #include "driver/rtc_io.h"
-#include <EasyButton.h>
-#include "EEPROM.h"
-#include <Uptime.h>  
+#include <Preferences.h>
+#include "certs.h"
+
+int sw_version = 2;
+
+//########################### GPIO Definitions #################################################
+const int motor_1_pin = 8;
+const int motor_2_pin = 9;
+const int light_1_pin = 18;
+const int light_2_pin = 17;
+const int controller_sleep = 5;
+const int belly_button_pin = 16;
+const int back_button_pin = 36;
+
+//########################### MQTT Configuration #################################################
+const char *mqtt_broker = "al8bkn1jra0r7-ats.iot.us-east-2.amazonaws.com";
+const int mqtt_port = 8883;
+// MQTT values variables
+int is_alive = 0;
+int device_status = 0;
+String paired_device_id;
+int paired_device_status = 0;
+int battery_warning_level = 1800;
+int low_battery = 0;
+bool reset_battery_status = false;
+int heartrate_ms = 0;
+int heartbeat_mode = 0;
+int belly_light_status = 0;
+int feel_option_status = 0;
+int sleep_after_time = 20000;
+bool new_OTA = false;
+//########################### Initialize Peripherals #################################################
+RTC_DATA_ATTR int bootCount = 0;
+EasyButton belly_button(belly_button_pin);
+EasyButton back_button(back_button_pin);
+Adafruit_DRV2605 vibrator;
+Adafruit_ADXL345_Unified accelerometer = Adafruit_ADXL345_Unified(12345);
+Preferences preferences;
+Uptime uptime;
+WiFiClient espClient_noSSL;
+WiFiClientSecure espClient = WiFiClientSecure();
+PubSubClient mqtt_client(espClient);
+void mqtt_callback(char *topic, byte *payload, unsigned int length);
 
 //########################### Initialize Wakeup setup #################################################
 #define BUTTON_PIN_BITMASK(GPIO) (1ULL << GPIO)  // 2 ^ GPIO_NUMBER in hex
@@ -16,316 +60,69 @@
 #define uS_TO_S_FACTOR 1000000ULL                // Conversion factor for micro seconds to seconds
 #define TIME_TO_SLEEP_FIRST_TIME 600             // Time ESP32 will go to sleep for 10 minutes
 #define TIME_TO_SLEEP_LATER 3600                 // Time ESP32 will go to sleep for 60 minutes
-RTC_DATA_ATTR int bootCount = 0;
-//########################### Initialize OTA Updater #################################################
-// S3 Bucket Config
-// Variables to validate
-// response from S3
-long contentLength = 0;
-bool isValidContentType = false;
-String host = "andreasandlinaotter.s3.us-east-2.amazonaws.com";  // Host => bucket-name.s3.region.amazonaws.com
-int port = 80;                                                   // Non https. For HTTPS 443. As of today, HTTPS doesn't work.
-String bin = "/otter.ino.bin";                                   // bin file name with a slash in front.
-NetworkClient client;
-
-// Utility to extract header value from headers
-String getHeaderValue(String header, String headerName) {
-  return header.substring(strlen(headerName.c_str()));
-}
-//########################### Initialize Peripherals #################################################
-Adafruit_DRV2605 vibrator;
-Adafruit_ADXL345_Unified accelerometer = Adafruit_ADXL345_Unified(12345);
-EEPROMClass UPTIME("eeprom0");
-Uptime uptime;
-
-
-//########################### Initialize General IO ##################################################
-const int motor_1_pin = 8;
-const int motor_2_pin = 9;
-const int light_1_pin = 18;
-const int light_2_pin = 17;
-const int controller_sleep = 5;
-const int belly_button_pin = 16;
-const int wifi_reset_button_pin = 36;
-EasyButton belly_button(belly_button_pin);
-EasyButton wifi_reset_button(wifi_reset_button_pin);
-
 
 //########################### Global Variables #######################################################
-unsigned long previousMillis = 0;
-sensors_event_t event;
-bool is_inactive = false;
-
-int heartrate_ms = 0;
-bool heart_mode_quiet = false;
-int sleep_after_time = 0;
-bool belly_movement = false;
-bool heartbeat_movement = true;
-bool belly_light_status = false;
-uint32_t total_uptime = 0;
-bool battery_msg = false;
-int battery_warning_level = 1800;
-
+int return_status = 0;
+int error_status = 0;  //1 = Vib driver error, 2 = accelerometer error, 3 = wifi connection error, 4 = mqtt error, 5 = update aws error, 6 = update esp32 error
 
 //########################### State Machine - States #################################################
 enum STATEMACHINE_STATE { STARTUP,
-                          CONFIGURE,
                           CONNECT,
+                          PAIRING,
                           IDLE,
                           SYNC_MODE,
+                          START_SLEEP_MODE,
                           SLEEP_MODE,
                           SLEEP_MODE_TIMER,
-                          UPDATE_MODE };
+                          UPDATE_MODE,
+                          ERROR_MODE,
+                          REBOOT_MODE };
 STATEMACHINE_STATE CURRENT_STATE = STARTUP;
 STATEMACHINE_STATE NEXT_STATE;
 
+enum MQTT_STATUS { CONNECTED = 0,
+                   PAIRED = 1,
+                   SYNCED = 2,
+                   NORMAL_SLEEP = 3,
+                   TIMER_SLEEP = 4,
+                   UPDATING = 5,
+                   UPDATE_DONE = 6,
+                   ERROR = 7 };
+//MQTT_STATUS STATUS = CONNECTED;
 
-
-//####################################################################################################
-//################################### Heartbeat Looper (no block) ####################################
-//####################################################################################################
-void heartbeat_loop() {
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= heartrate_ms) {
-    previousMillis = currentMillis;
-    if (heart_mode_quiet == true) {
-      vibrator.setWaveform(0, 46);  // play effect
-      vibrator.setWaveform(1, 0);   // end waveform
-      vibrator.go();                // play the effect!
-    } else {
-      vibrator.setWaveform(0, 37);  // play effect
-      vibrator.setWaveform(1, 0);   // end waveform
-      vibrator.go();                // play the effect!
-    }
-  }
-}
-
-int get_wakeup_reason() {
-  esp_sleep_wakeup_cause_t wakeup_reason;
-  wakeup_reason = esp_sleep_get_wakeup_cause();
-  switch (wakeup_reason) {
-    case ESP_SLEEP_WAKEUP_EXT0:
-      Serial.println("Wakeup caused by external signal using RTC_IO");
-      return 0;
-      break;
-    case ESP_SLEEP_WAKEUP_EXT1:
-      Serial.println("Wakeup caused by external signal using RTC_CNTL");
-      return 0;
-      break;
-    case ESP_SLEEP_WAKEUP_TIMER:
-      Serial.println("Wakeup caused by timer");
-      return 1;
-      break;
-    default:
-      return 0;
-      break;
-  }
-}
-
-// OTA Logic
-void execOTA() {
-  Serial.println("Connecting to: " + String(host));
-  if (client.connect(host.c_str(), port)) {
-    Serial.println("Fetching Bin: " + String(bin));
-    client.print(String("GET ") + bin + " HTTP/1.1\r\n" + "Host: " + host + "\r\n" + "Cache-Control: no-cache\r\n" + "Connection: close\r\n\r\n");
-    unsigned long timeout = millis();
-    while (client.available() == 0) {
-      if (millis() - timeout > 5000) {
-        Serial.println("Client Timeout !");
-        client.stop();
-        return;
-      }
-    }
-    while (client.available()) {
-      String line = client.readStringUntil('\n');
-      line.trim();
-      if (!line.length()) {
-        break;  // and get the OTA started
-      }
-      if (line.startsWith("HTTP/1.1")) {
-        if (line.indexOf("200") < 0) {
-          Serial.println("Got a non 200 status code from server. Exiting OTA Update.");
-          break;
-        }
-      }
-      if (line.startsWith("Content-Length: ")) {
-        contentLength = atol((getHeaderValue(line, "Content-Length: ")).c_str());
-        Serial.println("Got " + String(contentLength) + " bytes from server");
-      }
-      if (line.startsWith("Content-Type: ")) {
-        String contentType = getHeaderValue(line, "Content-Type: ");
-        Serial.println("Got " + contentType + " payload.");
-        if (contentType == "application/octet-stream") {
-          isValidContentType = true;
-        }
-      }
-    }
-  } else {
-    Serial.println("Connection to " + String(host) + " failed. Please check your setup");
-  }
-  Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
-  if (contentLength && isValidContentType) {
-    bool canBegin = Update.begin(contentLength);
-    if (canBegin) {
-      Serial.println("Begin OTA. This may take 2 - 5 mins to complete. Things might be quite for a while.. Patience!");
-      size_t written = Update.writeStream(client);
-      if (written == contentLength) {
-        Serial.println("Written : " + String(written) + " successfully");
-      } else {
-        Serial.println("Written only : " + String(written) + "/" + String(contentLength) + ". Retry?");
-      }
-      if (Update.end()) {
-        Serial.println("OTA done!");
-        if (Update.isFinished()) {
-          Serial.println("Update successfully completed. Rebooting.");
-          bootCount = 0;
-          check_if_update_is_done();
-        } else {
-          Serial.println("Update not finished? Something went wrong!");
-        }
-      } else {
-        Serial.println("Error Occurred. Error #: " + String(Update.getError()));
-      }
-    } else {
-      Serial.println("Not enough space to begin OTA");
-      client.clear();
-    }
-  } else {
-    Serial.println("There was no content in the response");
-    client.clear();
-  }
-}
-void check_if_update_is_done() {
-  hug_status_mine->save(3);
-  while (status_mine != 3) {
-    delay(1);
-    io.run();
-  }
-  Serial.println("update done message sent");
-  ESP.restart();
-}
-void check_if_shudown_notification_is_done(int counter) {
-  if (counter > 1) {
-    shutdown_reminder->save(shutdown_reminder_signal + 2);
-  } else {
-    shutdown_reminder->save(shutdown_reminder_signal);
-  }
-  while (shutdown_reminder_signal != 0) {
-    delay(1);
-    io.run();
-  }
-  Serial.println("shutdown notification done");
-}
-void belly_pressed_function() {
-  NEXT_STATE = STOP_EVERYTHING;
-}
-void wifi_reset_function() {
-  UPTIME.writeULong(0, 0);
-  UPTIME.commit();
-  delay(100);
-  //WiFiManager wm;
-  //wm.resetSettings();
-  ESP.restart();
-}
-bool is_battery_empty() {
-  uptime.calculateUptime();
-  int current_uptime = total_uptime + uptime.getMinutes();
-  if (current_uptime > battery_warning_level) {
-    return true;
-  } else {
-    return false;
-  }
-}
-
-//###################################################################################################################
 //###################################################################################################################
 //########################################################## SETUP ##################################################
-//###################################################################################################################
 //###################################################################################################################
 void setup() {
   //########################### Setup all GPIO Pins ##################################################
   Serial.begin(115200);
-  rtc_gpio_deinit(WAKEUP_GPIO);
-  bootCount++;
-  pinMode(LED_BUILTIN, OUTPUT);
-  pinMode(motor_1_pin, OUTPUT);
-  digitalWrite(motor_1_pin, LOW);
-  ledcAttach(motor_2_pin, 100000, 8);
-  //pinMode(motor_2_pin, OUTPUT);
-  pinMode(light_1_pin, OUTPUT);
-  pinMode(light_2_pin, OUTPUT);
-  digitalWrite(light_2_pin, LOW);
-  pinMode(controller_sleep, OUTPUT);
-  belly_button.begin();
-  wifi_reset_button.begin();
-  belly_button.onPressed(belly_pressed_function);
-  wifi_reset_button.onPressed(wifi_reset_function);
+  run_pin_initialization();
   if (get_wakeup_reason() == 0) {
-    digitalWrite(LED_BUILTIN, HIGH);
-    breathing_light_enable(20);  //Enable the LED
+    breathing_light_controller(true, 128);
   }
-  //########################### Start WiFi Manager ###################################################
-  WiFiManager wm;
-  bool res = wm.autoConnect("Otter", "");
-  if (!res) {
-    Serial.println("Failed to connect");
+  bootCount++;
+  belly_button.begin();
+  back_button.begin();
+  belly_button.onPressed(belly_button_pressed_function);
+  belly_button.onPressedFor(2000, belly_button_pressed_long_function);
+  back_button.onPressed(back_button_pressed_function);
+  run_peripheral_initilization();
+  get_dev_id();
+  if (start_wifi_manager() == -1) {
     ESP.restart();
-  } else {
-    Serial.println("connected...yeey :)");
   }
-
-  //########################### Start EEPROM ##########################################################
-  if (!UPTIME.begin(0x500)) {
-    Serial.println("Failed to initialize UPTIME EEPROM");
+  espClient.setCACert(amazonRootCA);
+  espClient.setCertificate(certificatePemCrt);
+  espClient.setPrivateKey(privatePemKey);
+  mqtt_client.setServer(mqtt_broker, mqtt_port);
+  mqtt_client.setCallback(mqtt_callback);
+  if (!mqtt_client.connected()) {
+    mqtt_connect();
   }
-  total_uptime = UPTIME.readULong(0);
-  Serial.print("uptime from EEPROM: ");
-  Serial.println(total_uptime);
-
-  //########################### Start Vibrator IO ####################################################
-  while (!vibrator.begin(&Wire1)) {
-    Serial.println("Could not find DRV2605, trying again");
-    delay(100);
-  }
-  vibrator.selectLibrary(1);
-  vibrator.setMode(DRV2605_MODE_INTTRIG);
-
-  //########################### Start Accelerometer ##################################################
-  while (!accelerometer.begin()) {
-    Serial.println("Ooops...Could not find ADXL345, trying again");
-    delay(100);
-  }
-  accelerometer.setRange(ADXL345_RANGE_4_G);
-
-  //########################### Connect to Adafruit IO ###############################################
-  Serial.printf("Connecting to Adafruit IO with User: %s\n", IO_USERNAME);
-  io.connect();
-  feel->onMessage(handleMessage);
-  belly_light->onMessage(handleMessage);
-  hug_status_mine->onMessage(handleMessage);
-  hug_status_them->onMessage(handleMessage);
-  heart_rate->onMessage(handleMessage);
-  heart_mode->onMessage(handleMessage);
-  sleep_after->onMessage(handleMessage);
-  shutdown_reminder->onMessage(handleMessage);
-  while ((io.status() < AIO_CONNECTED)) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println("Connected to Adafruit IO.");
-  feel->get();
-  belly_light->get();
-  heart_rate->get();
-  heart_mode->get();
-  sleep_after->get();
-  hug_status_them->get();
-  hug_status_mine->get();
-  digitalWrite(LED_BUILTIN, LOW);
 }
-//###################################################################################################################
+
 //###################################################################################################################
 //########################################################## LOOP ###################################################
-//###################################################################################################################
 //###################################################################################################################
 void loop() {
   //########################### State Machine Controller ###############################################
@@ -333,109 +130,120 @@ void loop() {
     CURRENT_STATE = NEXT_STATE;
     Serial.println(CURRENT_STATE);
   }
+  if (mqtt_client.connected()) {
+    mqtt_client.loop();
+  }
   belly_button.read();
-  wifi_reset_button.read();
+  back_button.read();
+  if (CURRENT_STATE > STARTUP) {
+    send_alive_signal();
+  }
+  if (is_battery_empty() == true) {
+    send_low_battery();
+  }
+  if (reset_battery_status == true) {
+    reset_uptime();
+    reset_battery_status = false;
+  }
+  if (stillness_detector() == true) {
+    NEXT_STATE = START_SLEEP_MODE;
+  }
+  if (new_OTA == true) {
+    new_OTA = false;
+    return_status = send_status(UPDATING);
+    if (return_status == -1) {
+      NEXT_STATE = ERROR_MODE;
+    } else {
+      NEXT_STATE = UPDATE_MODE;
+    }
+  }
   //########################### Main State Machine #####################################################
   switch (CURRENT_STATE) {
-    //########################### Startup ##############################################################
-    //########################### Get Latest Message of this otter status #############################
     case STARTUP:
-      if (start_checker == 7) {
-        if (get_wakeup_reason() == 1) {
-          NEXT_STATE = TIMER_SHUTDOWN;
-        }
-        if (get_wakeup_reason() == 0) {
-          delay(5);
-          if (status_mine == 0) {
-            status_mine = 1;
-            NEXT_STATE = SEND_SIGNAL;
-          } else {
-            NEXT_STATE = SEND_SIGNAL;
-          }
-        }
-      }
-      break;
-    //########################### Send Signal ##########################################################
-    //########################### Send out that we are active ##########################################
-    case SEND_SIGNAL:
-      hug_status_mine->save(1);
-      status_mine = 1;
-      NEXT_STATE = CHECK_SIGNAL;
-      break;
-    //########################### Check Signal ########################################################
-    //########################### Check if other otter is online ######################################
-    case CHECK_SIGNAL:
-      accelerometer.getEvent(&event);
-      is_inactive = check_for_inactivity(event.acceleration.x, event.acceleration.y, event.acceleration.z);
-      if (status_them == 1) {
-        breathing_light_disable(20);
-        NEXT_STATE = RUN_SYNCED;
-      }
-      if (is_inactive == true) {
-        NEXT_STATE = STOP_EVERYTHING;
-      }
-      if (status_mine == 2) {
-        NEXT_STATE = UPDATE_SW;
-      }
-      if(is_battery_empty() == true && battery_msg == false){
-        battery_msg = true;
-        hug_status_mine->save(4);
-      }
-      break;
-    //########################### Run Synced ###########################################################
-    //########################### Start the hearbeat and run in sync ###################################
-    case RUN_SYNCED:
-      accelerometer.getEvent(&event);
-      is_inactive = check_for_inactivity(event.acceleration.x, event.acceleration.y, event.acceleration.z);
-      if (status_them == 0) {
-        NEXT_STATE = STOP_EVERYTHING;
-      }
-      if (is_inactive == true) {
-        NEXT_STATE = STOP_EVERYTHING;
-      }
-      if (status_mine == 0) {
-        NEXT_STATE = STOP_EVERYTHING;
-      }
-      if (belly_light_status) {
-        breathing_light_enable(225);
+      setup_mqtt_callbacks();
+      if (get_wakeup_reason() == 1) {
+        NEXT_STATE = START_SLEEP_MODE;
       } else {
-        breathing_light_disable(225);
+        advertise_id();
+        NEXT_STATE = CONNECT;
       }
-      if (belly_movement) {
-        breathing_motor_starter(255);
+      break;
+
+    case CONNECT:
+      return_status = connect_and_request_settings();
+      if (return_status == 0) {
+        return_status = send_status(CONNECTED);
+        if (return_status == -1) {
+          NEXT_STATE = ERROR_MODE;
+        } else {
+          NEXT_STATE = PAIRING;
+        }
+      }
+      break;
+
+    case PAIRING:
+      if (pairing_is_done() == true) {
+        return_status = send_status(PAIRED);
+        if (return_status == -1) {
+          NEXT_STATE = ERROR_MODE;
+        } else {
+          NEXT_STATE = IDLE;
+        }
+      }
+      break;
+
+    case IDLE:
+      if (paired_device_status == PAIRED || paired_device_status == SYNCED) {
+        return_status = send_status(SYNCED);
+        if (return_status == -1) {
+          NEXT_STATE = ERROR_MODE;
+        } else {
+          NEXT_STATE = SYNC_MODE;
+        }
+      }
+      if (paired_device_status == NORMAL_SLEEP) {
+        NEXT_STATE = START_SLEEP_MODE;
+      }
+      break;
+
+    case SYNC_MODE:
+      if (belly_light_status == 1) {
+        breathing_light_controller(true, 255);
       } else {
-        breathing_motor_stopper(255);
+        breathing_light_controller(false, 255);
       }
-      if (heartbeat_movement) {
-        heartbeat_loop();
+      if (feel_option_status == 1) {
+        breathing_motor_controller(true, 255);
+      } else {
+        breathing_motor_controller(false, 255);
+        heartbeat_controller();
       }
-      if(is_battery_empty() == true && battery_msg == false){
-        battery_msg = true;
-        hug_status_mine->save(4);
+      if (paired_device_status >= NORMAL_SLEEP) {
+        NEXT_STATE = START_SLEEP_MODE;
       }
       break;
-    //########################### Stop Everything ######################################################
-    //########################### Stop all the things ##################################################
-    case STOP_EVERYTHING:
-      hug_status_mine->save(0);
-      uptime.calculateUptime();
-      total_uptime = total_uptime + uptime.getMinutes();
-      UPTIME.writeULong(0, total_uptime);
-      UPTIME.commit();
-      Serial.print("Total uptime is: ");
-      Serial.println(total_uptime);
-      if (belly_light_status) {
-        breathing_light_disable(225);
+    case START_SLEEP_MODE:
+      if (get_wakeup_reason() == 0) {
+        return_status = send_status(NORMAL_SLEEP);
+        if (return_status == -1) {
+          NEXT_STATE = ERROR_MODE;
+        } else {
+          NEXT_STATE = SLEEP_MODE;
+        }
+      } else {
+        return_status = send_status(TIMER_SLEEP);
+        if (return_status == -1) {
+          NEXT_STATE = ERROR_MODE;
+        } else {
+          NEXT_STATE = SLEEP_MODE_TIMER;
+        }
       }
-      if (belly_movement) {
-        breathing_motor_stopper(255);
-      }
-      digitalWrite(controller_sleep, LOW);
-      NEXT_STATE = GO_TO_SLEEP;
+      breathing_motor_controller(false, 255);
+      breathing_light_controller(false, 255);
       break;
-    //########################### Go to sleep ##########################################################
-    //########################### Simple things here ###################################################
-    case GO_TO_SLEEP:
+
+    case SLEEP_MODE:
+      delay(300);
       esp_sleep_enable_ext0_wakeup(WAKEUP_GPIO, 0);  //1 = High, 0 = Low
       if (bootCount >= 1) {
         bootCount = 0;
@@ -443,15 +251,11 @@ void loop() {
       esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP_FIRST_TIME * uS_TO_S_FACTOR);
       rtc_gpio_pullup_en(WAKEUP_GPIO);
       rtc_gpio_pulldown_dis(WAKEUP_GPIO);
-      delay(500);
       esp_deep_sleep_start();
       break;
-    //########################### Go to sleep after a timer reboot #####################################
-    //########################### only send a message out and go back to sleep #########################
-    case TIMER_SHUTDOWN:
-      Serial.print("timer shutdown state, counter is at:");
-      Serial.println(bootCount);
-      check_if_shudown_notification_is_done(bootCount);
+
+    case SLEEP_MODE_TIMER:
+      delay(300);
       esp_sleep_enable_ext0_wakeup(WAKEUP_GPIO, 0);  //1 = High, 0 = Low
       if (bootCount >= 1) {
         esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP_LATER * uS_TO_S_FACTOR);
@@ -462,13 +266,33 @@ void loop() {
       rtc_gpio_pulldown_dis(WAKEUP_GPIO);
       esp_deep_sleep_start();
       break;
-    //############################## Update the software ###############################################
-    //##################################################################################################
-    case UPDATE_SW:
-      hug_status_mine->save(2);
-      execOTA();
+
+    case UPDATE_MODE:
+      breathing_motor_controller(false, 255);
+      breathing_light_controller(false, 255);
+      digitalWrite(LED_BUILTIN, HIGH);
+      return_status = execOTA();
+      if (return_status == 0) {
+        return_status = send_status(UPDATE_DONE);
+        if (return_status == -1) {
+          NEXT_STATE = ERROR_MODE;
+        }
+        digitalWrite(LED_BUILTIN, LOW);
+        NEXT_STATE = REBOOT_MODE;
+      } else {
+        NEXT_STATE = ERROR_MODE;
+      }
+      break;
+    case ERROR_MODE:
+      return_status = send_status(ERROR);
+      if (return_status == -1) {
+        NEXT_STATE = ERROR_MODE;
+      }
+      NEXT_STATE = ERROR_MODE;
+      break;
+    case REBOOT_MODE:
+      delay(300);
+      ESP.restart();
       break;
   }
-  //########################### Runs Adafruit IO ######################################################
-  io.run();
 }

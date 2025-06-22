@@ -23,9 +23,6 @@ const int controller_sleep = 5;
 const int belly_button_pin = 16;
 const int back_button_pin = 36;
 
-//########################### MQTT Configuration #################################################
-const char *mqtt_broker = "al8bkn1jra0r7-ats.iot.us-east-2.amazonaws.com";
-const int mqtt_port = 8883;
 // MQTT values variables
 int is_alive = 0;
 int device_status = 0;

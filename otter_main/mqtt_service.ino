@@ -10,7 +10,7 @@ void get_dev_id(){
 void mqtt_connect() {
   while (!mqtt_client.connected()) {
     Serial.print("Attempting MQTT connection...");
-    if (mqtt_client.connect(device_ID)) {
+    if (mqtt_client.connect(device_ID, mqtt_username, mqtt_password)) {
       Serial.println("connected");
       break;
     } else {
@@ -100,8 +100,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     paired_device_status = message.toInt();
   } 
   else if(topic_str == "OTA_update"){
-    if(new_OTA == false && message.toInt() == 1){
-    new_OTA = true;
+    
+    if(new_OTA == false){
+      bin_name = message;
+      new_OTA = true;
     }
   }
   else if(topic_str == "battery_warn"){

@@ -12,7 +12,7 @@
 #include <Preferences.h>
 #include "certs.h"
 
-int sw_version = 2;
+int sw_version = 3;
 
 //########################### GPIO Definitions #################################################
 const int motor_1_pin = 8;
@@ -108,9 +108,7 @@ void setup() {
   if (start_wifi_manager() == -1) {
     ESP.restart();
   }
-  espClient.setCACert(amazonRootCA);
-  espClient.setCertificate(certificatePemCrt);
-  espClient.setPrivateKey(privatePemKey);
+  espClient.setCACert(RootCA);
   mqtt_client.setServer(mqtt_broker, mqtt_port);
   mqtt_client.setCallback(mqtt_callback);
   if (!mqtt_client.connected()) {
@@ -129,6 +127,8 @@ void loop() {
   }
   if (mqtt_client.connected()) {
     mqtt_client.loop();
+  } else {
+    mqtt_connect();
   }
   belly_button.read();
   back_button.read();
@@ -162,6 +162,7 @@ void loop() {
         NEXT_STATE = START_SLEEP_MODE;
       } else {
         advertise_id();
+        Serial.println("IT WORKKKEEDDDDD");
         NEXT_STATE = CONNECT;
       }
       break;

@@ -5,6 +5,7 @@ String getHeaderValue(String header, String headerName) {
 
 // OTA Logic
 int execOTA() {
+  String bin = "/" + bin_name + ".bin";
   Serial.println("Connecting to: " + String(host));
   if (espClient_noSSL.connect(host.c_str(), port)) {
     Serial.println("Fetching Bin: " + String(bin));
